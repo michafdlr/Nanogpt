@@ -3,15 +3,18 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 #--- Hyperparameters ---#
-context_length = 8
-batch_size = 32
-max_iters = 10_000
-learning_rate = 1e-2
+context_length = 256
+batch_size = 64
+max_iters = 5_000
+learning_rate = 3e-4
 eval_interval = 0.1 * max_iters
 eval_iters = 200
 device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-n_embed = 32
-head_size = 16
+n_embed = 384
+#head_size = 16
+n_heads = 6
+dropout = 0.2
+n_layer = 6
 #---
 
 torch.manual_seed(123)
@@ -60,6 +63,8 @@ class Head(nn.Module):
         self.key = nn.Linear(n_embed, head_size, bias=False)
         self.value = nn.Linear(n_embed, head_size, bias=False)
         self.register_buffer('tril' ,torch.tril(torch.ones((context_length, context_length))))
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
         B,T,C = x.shape
         q = self.query(x)
@@ -69,15 +74,55 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C**-0.5
         wei = wei.masked_fill(self.tril[:T, :T]==0, float('-inf')) # Decoder Block
         wei = F.softmax(wei, -1)
+        wei = self.dropout(wei)
         out = wei @ v
         return out
 
+class MultiHeadAttention(nn.Module):
+    def __init__(self, n_embed, n_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(n_embed, head_size) for _ in range(n_heads)])
+        self.proj = nn.Linear(n_embed, n_embed)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
+
+
+class FeedForward(nn.Module):
+    def __init__(self, n_embed):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embed, 4 * n_embed),
+            nn.ReLU(),
+            nn.Linear(4 * n_embed, n_embed),
+            nn.Dropout(dropout)
+            )
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    def __init__(self, n_embed, n_heads):
+        super().__init__()
+        head_size = n_embed//n_heads
+        self.sa = MultiHeadAttention(n_embed, n_heads, head_size)
+        self.net = FeedForward(n_embed)
+        self.ln1 = nn.LayerNorm(n_embed)
+        self.ln2 = nn.LayerNorm(n_embed)
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.net(self.ln2(x))
+        return x
+
 class BigrammModel(nn.Module):
-    def __init__(self, vocab_size, n_embed, context_length, head_size):
+    def __init__(self, vocab_size, n_embed, context_length):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(context_length, n_embed)
-        self.sa_head = Head(n_embed, n_embed)
+        self.blocks = nn.Sequential(*[Block(n_embed, n_heads=n_heads) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -86,7 +131,8 @@ class BigrammModel(nn.Module):
         token_emb = self.token_embedding_table(idx) #(B,T,n_embed)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) #(T,C)
         x = token_emb + pos_emb
-        x = self.sa_head(x)
+        x = self.blocks(x)
+        x = self.ln_f(x)
         logits = self.lm_head(x) #(B,T,vocab_size)
         if targets is None:
             loss = None
@@ -119,6 +165,7 @@ def estimate_loss(model,
             logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
+    model.train()
     return out
 
 
@@ -141,7 +188,7 @@ def training(model,
             losses = estimate_loss(model, batch_size)
             print(f"Mittlerer Train loss nach {i} Epochen: {losses['train']} || Mittlerer Val loss: {losses['val']}")
 
-model = BigrammModel(vocab_size, n_embed, context_length, head_size)
+model = BigrammModel(vocab_size, n_embed, context_length)
 m = model.to(device)
 
 training(m)
