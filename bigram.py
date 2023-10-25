@@ -10,7 +10,8 @@ learning_rate = 1e-2
 eval_interval = 0.1 * max_iters
 eval_iters = 200
 device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-
+n_embed = 32
+head_size = 16
 #---
 
 torch.manual_seed(123)
@@ -52,14 +53,41 @@ def get_batch(split: str="train",
     x, y = x.to(device), y.to(device)
     return x, y
 
-class BigrammModel(nn.Module):
-    def __init__(self, vocab_size):
+class Head(nn.Module):
+    def __init__(self, n_embed, head_size):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+        self.query = nn.Linear(n_embed, head_size, bias=False)
+        self.key = nn.Linear(n_embed, head_size, bias=False)
+        self.value = nn.Linear(n_embed, head_size, bias=False)
+        self.register_buffer('tril' ,torch.tril(torch.ones((context_length, context_length))))
+    def forward(self, x):
+        B,T,C = x.shape
+        q = self.query(x)
+        k = self.key(x)
+        v = self.value(x)
+
+        wei = q @ k.transpose(-2, -1) * C**-0.5
+        wei = wei.masked_fill(self.tril[:T, :T]==0, float('-inf')) # Decoder Block
+        wei = F.softmax(wei, -1)
+        out = wei @ v
+        return out
+
+class BigrammModel(nn.Module):
+    def __init__(self, vocab_size, n_embed, context_length, head_size):
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
+        self.position_embedding_table = nn.Embedding(context_length, n_embed)
+        self.sa_head = Head(n_embed, n_embed)
+        self.lm_head = nn.Linear(n_embed, vocab_size)
 
     def forward(self, idx, targets=None):
+        B,T = idx.shape
         # idx shape and targets shape = batch_size, context_length
-        logits = self.token_embedding_table(idx) # (batch_size, context_length, vocab_size) = (B, T, C)
+        token_emb = self.token_embedding_table(idx) #(B,T,n_embed)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) #(T,C)
+        x = token_emb + pos_emb
+        x = self.sa_head(x)
+        logits = self.lm_head(x) #(B,T,vocab_size)
         if targets is None:
             loss = None
         else:
@@ -71,7 +99,8 @@ class BigrammModel(nn.Module):
 
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
-            logits, loss = self(idx)
+            idx_cond = idx[:, -context_length:]
+            logits, loss = self(idx_cond)
             probs = F.softmax(logits[:,-1,:], dim=-1)
             idx_new = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_new), dim=1)
@@ -112,7 +141,7 @@ def training(model,
             losses = estimate_loss(model, batch_size)
             print(f"Mittlerer Train loss nach {i} Epochen: {losses['train']} || Mittlerer Val loss: {losses['val']}")
 
-model = BigrammModel(vocab_size)
+model = BigrammModel(vocab_size, n_embed, context_length, head_size)
 m = model.to(device)
 
 training(m)
