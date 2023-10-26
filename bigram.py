@@ -4,14 +4,13 @@ from torch.nn import functional as F
 
 #--- Hyperparameters ---#
 context_length = 256
-batch_size = 64
+batch_size = 128
 max_iters = 5_000
 learning_rate = 3e-4
 eval_interval = 0.1 * max_iters
 eval_iters = 200
 device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-n_embed = 384
-#head_size = 16
+n_embed = 6 * 64
 n_heads = 6
 dropout = 0.2
 n_layer = 6
@@ -35,21 +34,19 @@ encode = lambda s: [stoi[l] for l in s] # Kodierungsfunktion
 decode = lambda i: ''.join([itos[ix] for ix in i]) # Dekodierungsfunktion
 
 # Texte tokenizieren
-data_faust = torch.tensor(encode(faust), dtype = torch.long)
-data_faust_2 = torch.tensor(encode(faust_2), dtype = torch.long)
+data_faust = torch.tensor(encode(faust + faust_2), dtype = torch.long)
 
 # Train, val test splits
 train_length = int(0.9 * len(data_faust))
 data_train = data_faust[:train_length]
 data_val = data_faust[train_length:]
-data_test = data_faust_2
 
 # Batch Funktion
 def get_batch(split: str="train",
               batch_size: int=batch_size,
               device: str=device) -> tuple[torch.tensor, torch.tensor]:
     """Erzeugt Batches für das parallele Training"""
-    data = data_train if split == "train" else data_val if split == "val" else data_test
+    data = data_train if split == "train" else data_val
     ix = torch.randint(len(data) - context_length, (batch_size,))
     x = torch.stack([data[i:i + context_length] for i in ix])
     y = torch.stack([data[i+1: i+context_length+1] for i in ix])
@@ -192,5 +189,5 @@ model = BigrammModel(vocab_size, n_embed, context_length)
 m = model.to(device)
 
 training(m)
-
-print(decode(m.generate(torch.zeros((1,1), dtype=torch.long, device=device), 500)[0].tolist()))
+generated_text = decode(m.generate(torch.zeros((1,1), dtype=torch.long, device=device), 10_00)[0].tolist())
+print(generated_text)
